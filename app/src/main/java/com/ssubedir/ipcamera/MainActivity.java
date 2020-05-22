@@ -20,6 +20,7 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton;
 import com.google.android.material.snackbar.Snackbar;
 import com.google.protobuf.ByteString;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
@@ -45,13 +46,23 @@ import java.net.InetAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
 
 public class MainActivity extends AppCompatActivity {
 
+    private ManagedChannel channel = ManagedChannelBuilder.forAddress("192.168.1.46",9000).usePlaintext().build();
+    private IpCameraGrpc.IpCameraBlockingStub ipCameraBlockingStub =IpCameraGrpc.newBlockingStub(channel);
+    private IpCameraGrpc.IpCameraStub asyncStub =IpCameraGrpc.newStub(channel);
+    StreamObserver<StreamVideoRequest> requestObserver;
 
     private boolean isRecording = false;
 
-    public static final String LOG_TAG = "myLogs";
+    public static final String LOG_TAG = "IpCamera";
     public static Surface surface = null;
 
     CameraService[] myCameras = null;
@@ -59,21 +70,14 @@ public class MainActivity extends AppCompatActivity {
     private CameraManager mCameraManager = null;
     private final int CAMERA1 = 0;
 
-    private Button mButtonOpenCamera1 = null;
-    private Button mButtonStreamVideo = null;
-    private Button mButtonTStopStreamVideo = null;
     public static TextureView mImageView = null;
     private HandlerThread mBackgroundThread;
     private Handler mBackgroundHandler = null;
 
-    private MediaCodec mCodec = null; // кодер
-    Surface mEncoderSurface; // Surface как вход данных для кодера
+    private MediaCodec mCodec = null; // encoder
+    Surface mEncoderSurface; // Surface as data input for encoder
     BufferedOutputStream outputStream;
     ByteBuffer outPutByteBuffer;
-    DatagramSocket udpSocket;
-    String ip_address = "192.168.1.84";
-    InetAddress address;
-    int port = 40002;
 
     private void startBackgroundThread() {
         mBackgroundThread = new HandlerThread("CameraBackground");
@@ -93,6 +97,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
 
+
     @RequiresApi(api = Build.VERSION_CODES.M)
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -104,7 +109,7 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
 
-        Log.d(LOG_TAG, "Запрашиваем разрешение");
+        Log.d(LOG_TAG, "Request permission");
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
                 ||
                 (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
@@ -132,10 +137,16 @@ public class MainActivity extends AppCompatActivity {
                 }else{
                     Snackbar.make(view, "Stopped Streaming", Snackbar.LENGTH_LONG)
                             .setAction("Action", null).show();
+
+                    try {
+                        requestObserver.onCompleted(); // close stream
+                        channel.shutdown().awaitTermination(10, TimeUnit.SECONDS); // close connection
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+
                     isRecording = false;
                     if (mCodec != null) {
-
-                        //Toast.makeText(MainActivity.this, " остановили стрим", Toast.LENGTH_SHORT).show();
                         myCameras[CAMERA1].stopStreamingVideo();
                     }
                 }
@@ -143,36 +154,17 @@ public class MainActivity extends AppCompatActivity {
         });
 
 
-        try {
-            udpSocket = new DatagramSocket();
-
-            Log.i(LOG_TAG, "  создали udp сокет");
-
-        } catch (
-                SocketException e) {
-            Log.i(LOG_TAG, " не создали udp сокет");
-        }
-
-        try {
-            address = InetAddress.getByName(ip_address);
-            Log.i(LOG_TAG, "  есть адрес");
-        } catch (Exception e) {
-
-
-        }
-
-
 
         mCameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
         try {
-            // Получение списка камер с устройства
+            // Getting a list of cameras from a device
 
             myCameras = new CameraService[mCameraManager.getCameraIdList().length];
 
             for (String cameraID : mCameraManager.getCameraIdList()) {
                 Log.i(LOG_TAG, "cameraID: " + cameraID);
                 int id = Integer.parseInt(cameraID);
-                // создаем обработчик для камеры
+                // create a handler for the camera
                 myCameras[id] = new CameraService(mCameraManager, cameraID);
 
             }
@@ -214,7 +206,7 @@ public class MainActivity extends AppCompatActivity {
             public void onDisconnected(CameraDevice camera) {
                 mCameraDevice.close();
 
-                Log.i(LOG_TAG, "disconnect camera  with id:" + mCameraDevice.getId());
+                Log.i(LOG_TAG, "Disconnect camera  with id:" + mCameraDevice.getId());
                 mCameraDevice = null;
             }
 
@@ -316,21 +308,41 @@ public class MainActivity extends AppCompatActivity {
     }
 
 
+    @RequiresApi(api = Build.VERSION_CODES.M)
     private void setUpMediaCodec() {
+        requestObserver = asyncStub.withDeadlineAfter(5, TimeUnit.MINUTES)
+                .streamVideo(new StreamObserver<StreamVideoResponse>() {
+
+                    @Override
+                    public void onNext(StreamVideoResponse value) {
+                        Log.i("IpCamera", "received stream response");
+                    }
+
+                    @Override
+                    public void onError(Throwable t) {
+                        Log.i("IpCamera", "streaming failed");
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        Log.i("IpCamera", "streaming ended");
+                    }
+                });
+
 
         try {
-            mCodec = MediaCodec.createEncoderByType("video/avc"); // H264 кодек
+            mCodec = MediaCodec.createEncoderByType("video/avc"); //H264 codec
 
         } catch (Exception e) {
-            Log.i(LOG_TAG, "а нету кодека");
+            Log.i(LOG_TAG, "error creating media codec");
         }
 
-        int width = 320; // ширина видео
-        int height = 240; // высота видео
-        int colorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface; // формат ввода цвета
-        int videoBitrate = 500000; // битрейт видео в bps (бит в секунду)
+        int width = 320; // video width
+        int height = 240; // video height
+        int colorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface; // color input format
+        int videoBitrate = 500000; // video bit rate in bps (bit per second)
         int videoFramePerSecond = 20; // FPS
-        int iframeInterval = 3; // I-Frame интервал в секундах
+        int iframeInterval = 3; // I-Frame interval in seconds
 
         MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat);
@@ -339,16 +351,16 @@ public class MainActivity extends AppCompatActivity {
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iframeInterval);
 
 
-        mCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); // конфигурируем кодек как кодер
-        mEncoderSurface = mCodec.createInputSurface(); // получаем Surface кодера
-
+        mCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); // configure the codec as an encoder
+        mEncoderSurface = mCodec.createInputSurface();// get the encoder Surface
         mCodec.setCallback(new EncoderCallback());
-        mCodec.start(); // запускаем кодер
-        Log.i(LOG_TAG, "запустили кодек");
+        mCodec.start(); // run the encoder
+        Log.i(LOG_TAG, "launched the codec");
 
     }
 
-    private class EncoderCallback extends MediaCodec.Callback {
+    @RequiresApi(api = Build.VERSION_CODES.M)
+    private class EncoderCallback extends MediaCodec.Callback implements MediaCodec.OnFrameRenderedListener {
 
         @Override
         public void onInputBufferAvailable(MediaCodec codec, int index) {
@@ -357,25 +369,20 @@ public class MainActivity extends AppCompatActivity {
 
         @Override
         public void onOutputBufferAvailable(MediaCodec codec, int index, MediaCodec.BufferInfo info) {
-
-            Client client = new Client("192.168.1.46",9000);
             outPutByteBuffer = mCodec.getOutputBuffer(index);
             byte[] outDate = new byte[info.size];
             outPutByteBuffer.get(outDate);
-
-//            outPutByteBuffer.position(info.offset);
-//            outPutByteBuffer.limit(info.offset + info.size);
-//            byte[] ba = new byte[outPutByteBuffer.remaining()];
-//            outPutByteBuffer.get(ba);
-
-
-
-            client.StreamImage(ByteString.copyFrom(outDate));
             try {
-                client.Shutdown();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
+                StreamVideoRequest request = StreamVideoRequest.newBuilder()
+                            .setVideo(ByteString.copyFrom(outDate))
+                            .build();
+                    requestObserver.onNext(request);
+                    Log.i("IpCamera", "sent h264 chunk to server");
+            } catch (Exception e) {
+                Log.i("IpCamera", "unexpected error:"+ e.getMessage());
+                requestObserver.onError(e);
             }
+            
             mCodec.releaseOutputBuffer(index, false);
         }
 
@@ -387,6 +394,11 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) {
             Log.i(LOG_TAG, "encoder output format changed: " + format);
+        }
+
+        @Override
+        public void onFrameRendered(@NonNull MediaCodec codec, long presentationTimeUs, long nanoTime) {
+
         }
     }
 
